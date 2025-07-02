@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>Voice Assistant (WebSocket Test)</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 50px auto;
+            padding: 20px;
+        }
+
+        button {
+            padding: 10px 20px;
+            margin: 10px;
+            font-size: 16px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+        }
+
+        .start-btn {
+            background-color: #4CAF50;
+            color: white;
+        }
+
+        .stop-btn {
+            background-color: #f44336;
+            color: white;
+        }
+
+        .start-btn:disabled,
+        .stop-btn:disabled {
+            background-color: #cccccc;
+            cursor: not-allowed;
+        }
+
+        #response {
+            background-color: #f5f5f5;
+            padding: 15px;
+            border-radius: 5px;
+            min-height: 100px;
+            margin-top: 20px;
+        }
+
+        #status {
+            padding: 10px;
+            margin: 10px 0;
+            border-radius: 5px;
+        }
+
+        .status-connected {
+            background-color: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+
+        .status-disconnected {
+            background-color: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+
+        .status-recording {
+            background-color: #fff3cd;
+            color: #856404;
+            border: 1px solid #ffeaa7;
+        }
+    </style>
+</head>
+
+<body>
+    <h2>🧠 LangChain Voice Assistant</h2>
+
+    <div id="status" class="status-disconnected">
+        Status: Disconnected
+    </div>
+
+    <button id="startBtn" class="start-btn" onclick="startRecording()">🎤 Start Recording</button>
+    <button id="stopBtn" class="stop-btn" onclick="stopRecording()" disabled>🛑 Stop</button>
+
+    <p><strong>Assistant Response:</strong></p>
+    <pre id="response">No response yet</pre>
+
+    <script>
+        let socket;
+        let audioContext;
+        let mediaStreamSource;
+        let processor;
+        let isRecording = false;
+
+        function updateStatus(message, className) {
+            const statusEl = document.getElementById('status');
+            statusEl.textContent = `Status: ${message}`;
+            statusEl.className = className;
+        }
+
+        function updateButtons(recording) {
+            document.getElementById('startBtn').disabled = recording;
+            document.getElementById('stopBtn').disabled = !recording;
+        }
+
+        // Convert Float32Array to Int16Array (PCM 16-bit)
+        function float32ToInt16(float32Array) {
+            const int16Array = new Int16Array(float32Array.length);
+            for (let i = 0; i < float32Array.length; i++) {
+                // Clamp values to [-1, 1] and convert to 16-bit integers
+                const clampedValue = Math.max(-1, Math.min(1, float32Array[i]));
+                int16Array[i] = clampedValue * 0x7FFF; // 32767
+            }
+            return int16Array;
+        }
+
+        // Resample audio from source sample rate to 16kHz
+        function resampleTo16kHz(audioBuffer, sourceSampleRate) {
+            if (sourceSampleRate === 16000) {
+                return audioBuffer; // No resampling needed
+            }
+
+            const ratio = sourceSampleRate / 16000;
+            const newLength = Math.round(audioBuffer.length / ratio);
+            const result = new Float32Array(newLength);
+
+            for (let i = 0; i < newLength; i++) {
+                const sourceIndex = i * ratio;
+                const index = Math.floor(sourceIndex);
+                const fraction = sourceIndex - index;
+
+                if (index + 1 < audioBuffer.length) {
+                    // Linear interpolation
+                    result[i] = audioBuffer[index] * (1 - fraction) + audioBuffer[index + 1] * fraction;
+                } else {
+                    result[i] = audioBuffer[index];
+                }
+            }
+
+            return result;
+        }
+
+        async function startRecording() {
+            try {
+                updateStatus("Requesting microphone permission...", "status-recording");
+
+                // Get audio stream from microphone
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    audio: {
+                        sampleRate: 16000,  // Try to get 16kHz directly
+                        channelCount: 1,    // Mono
+                        echoCancellation: true,
+                        noiseSuppression: true,
+                        autoGainControl: true
+                    }
+                });
+
+                // Create AudioContext
+                audioContext = new (window.AudioContext || window.webkitAudioContext)({
+                    sampleRate: 16000 // Try to set context to 16kHz
+                });
+
+                updateStatus("Connecting to server...", "status-recording");
+
+                // Connect to WebSocket
+                socket = new WebSocket("ws://localhost:8004/ws");
+
+                socket.onopen = () => {
+                    console.log("WebSocket connected");
+                    updateStatus("Connected - Recording...", "status-connected");
+                    isRecording = true;
+                    updateButtons(true);
+
+                    // Create audio processing pipeline
+                    mediaStreamSource = audioContext.createMediaStreamSource(stream);
+
+                    // Create ScriptProcessorNode for real-time audio processing
+                    processor = audioContext.createScriptProcessor(4096, 1, 1);
+
+                    processor.onaudioprocess = (event) => {
+                        if (!isRecording || socket.readyState !== WebSocket.OPEN) {
+                            return;
+                        }
+
+                        const inputBuffer = event.inputBuffer;
+                        const inputData = inputBuffer.getChannelData(0); // Get mono channel
+
+                        // Resample to 16kHz if necessary
+                        const resampledData = resampleTo16kHz(inputData, inputBuffer.sampleRate);
+
+                        // Convert to 16-bit PCM
+                        const pcmData = float32ToInt16(resampledData);
+
+                        // Send PCM data as binary
+                        if (socket.readyState === WebSocket.OPEN) {
+                            socket.send(pcmData.buffer);
+                        }
+                    };
+
+                    // Connect the audio processing chain
+                    mediaStreamSource.connect(processor);
+                    processor.connect(audioContext.destination);
+                };
+
+                socket.onmessage = (event) => {
+                    console.log("Received response:", event.data);
+                    document.getElementById("response").textContent = event.data;
+                };
+
+                socket.onerror = (error) => {
+                    console.error("WebSocket error:", error);
+                    updateStatus("Connection error", "status-disconnected");
+                    stopRecording();
+                };
+
+                socket.onclose = () => {
+                    console.log("WebSocket closed");
+                    updateStatus("Disconnected", "status-disconnected");
+                    stopRecording();
+                };
+
+            } catch (error) {
+                console.error("Error starting recording:", error);
+                updateStatus(`Error: ${error.message}`, "status-disconnected");
+                alert(`Error starting recording: ${error.message}`);
+            }
+        }
+
+        function stopRecording() {
+            isRecording = false;
+            updateButtons(false);
+
+            // Clean up audio processing
+            if (processor) {
+                processor.disconnect();
+                processor = null;
+            }
+
+            if (mediaStreamSource) {
+                mediaStreamSource.disconnect();
+                mediaStreamSource = null;
+            }
+
+            if (audioContext) {
+                audioContext.close();
+                audioContext = null;
+            }
+
+            // Close WebSocket
+            if (socket) {
+                socket.close();
+                socket = null;
+            }
+
+            updateStatus("Disconnected", "status-disconnected");
+            console.log("Recording stopped");
+        }
+
+        // Handle page unload
+        window.addEventListener('beforeunload', () => {
+            stopRecording();
+        });
+
+        // Initialize UI
+        updateButtons(false);
+    </script>
+</body>
+
+</html>
