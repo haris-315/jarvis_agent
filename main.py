@@ -39,6 +39,8 @@ async def process_transcript(state: AgentState) -> AgentState:
     transcript = state["transcript"]
     if not transcript:
         return {"transcript": transcript, "response": ""}
+    if transcript == "" or len(transcript) <= 5:
+        return {"transcript" : "", "response" : ""}
     
     try:
         
@@ -115,9 +117,10 @@ async def websocket_endpoint(websocket: WebSocket):
         while True:
             
             data = await websocket.receive_bytes()
-            if not data:
-                print("Received empty audio data")
-                continue
+            if not data or len(data) == 0:  
+                print("Received empty or no audio data, stopping further processing")
+                break  
+
             
             try:
                 transcriber.stream(data)
@@ -139,9 +142,9 @@ async def websocket_endpoint(websocket: WebSocket):
         await websocket.close()
         print("WebSocket connection closed")
 
-
 async def send_gpt_response(websocket: WebSocket, transcript: str, loop: asyncio.AbstractEventLoop):
-    if not transcript:
+    if not transcript or transcript.strip() == "":  
+        print("No valid transcript to process, skipping GPT response")
         return
     try:
         
