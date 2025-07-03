@@ -9,6 +9,7 @@
             max-width: 800px;
             margin: 50px auto;
             padding: 20px;
+            background-color: black;
         }
 
         button {
@@ -37,11 +38,25 @@
         }
 
         #response {
-            background-color: #f5f5f5;
+            color: white;
+            border: grey 1px solid;
             padding: 15px;
             border-radius: 5px;
             min-height: 100px;
             margin-top: 20px;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            font-family: inherit;
+        }
+
+        #transcript {
+            color: #90EE90;
+            border: #4CAF50 1px solid;
+            padding: 15px;
+            border-radius: 5px;
+            min-height: 50px;
+            margin-top: 20px;
+            font-style: italic;
         }
 
         #status {
@@ -67,6 +82,78 @@
             color: #856404;
             border: 1px solid #ffeaa7;
         }
+
+        .status-processing {
+            background-color: #cce5ff;
+            color: #004085;
+            border: 1px solid #b3d9ff;
+        }
+
+        .typing-indicator {
+            color: #888;
+            font-style: italic;
+        }
+
+        .typing-indicator::after {
+            content: '...';
+            animation: dots 1.5s infinite;
+        }
+
+        @keyframes dots {
+
+            0%,
+            20% {
+                content: '';
+            }
+
+            40% {
+                content: '.';
+            }
+
+            60% {
+                content: '..';
+            }
+
+            80%,
+            100% {
+                content: '...';
+            }
+        }
+
+        .error {
+            color: #ff6b6b;
+            background-color: #2d1b1b;
+            padding: 10px;
+            border-radius: 5px;
+            margin-top: 10px;
+        }
+
+        .conversation-history {
+            max-height: 400px;
+            overflow-y: auto;
+            border: 1px solid #333;
+            padding: 10px;
+            margin-top: 20px;
+            background-color: #111;
+        }
+
+        .conversation-item {
+            margin: 10px 0;
+            padding: 8px;
+            border-radius: 5px;
+        }
+
+        .user-message {
+            background-color: #1a3d1a;
+            color: #90EE90;
+            border-left: 3px solid #4CAF50;
+        }
+
+        .assistant-message {
+            background-color: #1a1a3d;
+            color: #90c5f7;
+            border-left: 3px solid #4a90e2;
+        }
     </style>
 </head>
 
@@ -79,9 +166,16 @@
 
     <button id="startBtn" class="start-btn" onclick="startRecording()">🎤 Start Recording</button>
     <button id="stopBtn" class="stop-btn" onclick="stopRecording()" disabled>🛑 Stop</button>
+    <button id="clearBtn" class="start-btn" onclick="clearConversation()">🗑️ Clear</button>
+
+    <p><strong>Current Transcript:</strong></p>
+    <div id="transcript">Listening...</div>
 
     <p><strong>Assistant Response:</strong></p>
-    <pre id="response">No response yet</pre>
+    <div id="response">No response yet</div>
+
+    <p><strong>Conversation History:</strong></p>
+    <div id="conversationHistory" class="conversation-history"></div>
 
     <script>
         let socket;
@@ -89,6 +183,9 @@
         let mediaStreamSource;
         let processor;
         let isRecording = false;
+        let currentResponse = '';
+        let conversationHistory = [];
+        let isProcessing = false;
 
         function updateStatus(message, className) {
             const statusEl = document.getElementById('status');
@@ -101,21 +198,78 @@
             document.getElementById('stopBtn').disabled = !recording;
         }
 
-        // Convert Float32Array to Int16Array (PCM 16-bit)
+        function updateTranscript(text) {
+            document.getElementById('transcript').textContent = text || 'Listening...';
+        }
+
+        function updateResponse(text, isComplete = false) {
+            const responseEl = document.getElementById('response');
+            if (isComplete) {
+                responseEl.textContent = text;
+                responseEl.classList.remove('typing-indicator');
+            } else {
+                responseEl.textContent = text;
+                if (!isComplete && isProcessing) {
+                    responseEl.classList.add('typing-indicator');
+                }
+            }
+        }
+
+        function showError(message) {
+            const responseEl = document.getElementById('response');
+            responseEl.innerHTML = `<div class="error">Error: ${message}</div>`;
+            responseEl.classList.remove('typing-indicator');
+            isProcessing = false;
+        }
+
+        function addToConversationHistory(transcript, response) {
+            conversationHistory.push({ transcript, response, timestamp: new Date() });
+            renderConversationHistory();
+        }
+
+        function renderConversationHistory() {
+            const historyEl = document.getElementById('conversationHistory');
+            historyEl.innerHTML = '';
+
+            conversationHistory.forEach((item, index) => {
+                const userDiv = document.createElement('div');
+                userDiv.className = 'conversation-item user-message';
+                userDiv.innerHTML = `<strong>You:</strong> ${item.transcript}`;
+
+                const assistantDiv = document.createElement('div');
+                assistantDiv.className = 'conversation-item assistant-message';
+                assistantDiv.innerHTML = `<strong>Assistant:</strong> ${item.response}`;
+
+                historyEl.appendChild(userDiv);
+                historyEl.appendChild(assistantDiv);
+            });
+
+
+            historyEl.scrollTop = historyEl.scrollHeight;
+        }
+
+        function clearConversation() {
+            conversationHistory = [];
+            renderConversationHistory();
+            updateResponse('No response yet');
+            updateTranscript('Listening...');
+        }
+
+
         function float32ToInt16(float32Array) {
             const int16Array = new Int16Array(float32Array.length);
             for (let i = 0; i < float32Array.length; i++) {
-                // Clamp values to [-1, 1] and convert to 16-bit integers
+
                 const clampedValue = Math.max(-1, Math.min(1, float32Array[i]));
-                int16Array[i] = clampedValue * 0x7FFF; // 32767
+                int16Array[i] = clampedValue * 0x7FFF;
             }
             return int16Array;
         }
 
-        // Resample audio from source sample rate to 16kHz
+
         function resampleTo16kHz(audioBuffer, sourceSampleRate) {
             if (sourceSampleRate === 16000) {
-                return audioBuffer; // No resampling needed
+                return audioBuffer;
             }
 
             const ratio = sourceSampleRate / 16000;
@@ -128,7 +282,7 @@
                 const fraction = sourceIndex - index;
 
                 if (index + 1 < audioBuffer.length) {
-                    // Linear interpolation
+
                     result[i] = audioBuffer[index] * (1 - fraction) + audioBuffer[index + 1] * fraction;
                 } else {
                     result[i] = audioBuffer[index];
@@ -142,25 +296,25 @@
             try {
                 updateStatus("Requesting microphone permission...", "status-recording");
 
-                // Get audio stream from microphone
+
                 const stream = await navigator.mediaDevices.getUserMedia({
                     audio: {
-                        sampleRate: 16000,  // Try to get 16kHz directly
-                        channelCount: 1,    // Mono
+                        sampleRate: 16000,
+                        channelCount: 1,
                         echoCancellation: true,
                         noiseSuppression: true,
                         autoGainControl: true
                     }
                 });
 
-                // Create AudioContext
+
                 audioContext = new (window.AudioContext || window.webkitAudioContext)({
-                    sampleRate: 16000 // Try to set context to 16kHz
+                    sampleRate: 16000
                 });
 
                 updateStatus("Connecting to server...", "status-recording");
 
-                // Connect to WebSocket
+
                 socket = new WebSocket("ws://localhost:8000/ws");
 
                 socket.onopen = () => {
@@ -168,11 +322,12 @@
                     updateStatus("Connected - Recording...", "status-connected");
                     isRecording = true;
                     updateButtons(true);
+                    updateTranscript('Listening...');
 
-                    // Create audio processing pipeline
+
                     mediaStreamSource = audioContext.createMediaStreamSource(stream);
 
-                    // Create ScriptProcessorNode for real-time audio processing
+
                     processor = audioContext.createScriptProcessor(4096, 1, 1);
 
                     processor.onaudioprocess = (event) => {
@@ -181,33 +336,86 @@
                         }
 
                         const inputBuffer = event.inputBuffer;
-                        const inputData = inputBuffer.getChannelData(0); // Get mono channel
+                        const inputData = inputBuffer.getChannelData(0);
 
-                        // Resample to 16kHz if necessary
+
                         const resampledData = resampleTo16kHz(inputData, inputBuffer.sampleRate);
 
-                        // Convert to 16-bit PCM
+
                         const pcmData = float32ToInt16(resampledData);
 
-                        // Send PCM data as binary
+
                         if (socket.readyState === WebSocket.OPEN) {
                             socket.send(pcmData.buffer);
                         }
                     };
 
-                    // Connect the audio processing chain
+
                     mediaStreamSource.connect(processor);
                     processor.connect(audioContext.destination);
                 };
 
                 socket.onmessage = (event) => {
-                    console.log("Received response:", event.data);
-                    document.getElementById("response").textContent = event.data;
+                    try {
+                        const data = JSON.parse(event.data);
+                        console.log("Received message:", data);
+
+                        switch (data.type) {
+                            case 'start':
+                                console.log("Processing started for:", data.transcript);
+                                updateTranscript(data.transcript);
+                                updateStatus("Processing response...", "status-processing");
+                                currentResponse = '';
+                                isProcessing = true;
+                                updateResponse('', false);
+                                break;
+
+                            case 'chunk':
+                                console.log("Received chunk:", data.text);
+                                currentResponse += data.text;
+                                updateResponse(currentResponse, false);
+                                break;
+
+                            case 'end':
+                                console.log("Response completed");
+                                updateResponse(currentResponse, true);
+                                updateStatus("Connected - Recording...", "status-connected");
+                                isProcessing = false;
+
+
+                                const transcript = document.getElementById('transcript').textContent;
+                                if (transcript && transcript !== 'Listening...' && currentResponse) {
+                                    addToConversationHistory(transcript, currentResponse);
+                                }
+
+
+                                updateTranscript('Listening...');
+                                break;
+
+                            case 'error':
+                                console.error("Server error:", data.text);
+                                showError(data.text);
+                                updateStatus("Connected - Recording...", "status-connected");
+                                updateTranscript('Listening...');
+                                break;
+
+                            default:
+
+                                console.log("Received legacy response:", event.data);
+                                updateResponse(event.data, true);
+                                break;
+                        }
+                    } catch (error) {
+
+                        console.log("Received non-JSON response:", event.data);
+                        updateResponse(event.data, true);
+                    }
                 };
 
                 socket.onerror = (error) => {
                     console.error("WebSocket error:", error);
                     updateStatus("Connection error", "status-disconnected");
+                    showError("Connection error occurred");
                     stopRecording();
                 };
 
@@ -220,15 +428,16 @@
             } catch (error) {
                 console.error("Error starting recording:", error);
                 updateStatus(`Error: ${error.message}`, "status-disconnected");
-                alert(`Error starting recording: ${error.message}`);
+                showError(`Error starting recording: ${error.message}`);
             }
         }
 
         function stopRecording() {
             isRecording = false;
+            isProcessing = false;
             updateButtons(false);
 
-            // Clean up audio processing
+
             if (processor) {
                 processor.disconnect();
                 processor = null;
@@ -244,23 +453,25 @@
                 audioContext = null;
             }
 
-            // Close WebSocket
+
             if (socket) {
                 socket.close();
                 socket = null;
             }
 
             updateStatus("Disconnected", "status-disconnected");
+            updateTranscript('Listening...');
             console.log("Recording stopped");
         }
 
-        // Handle page unload
+
         window.addEventListener('beforeunload', () => {
             stopRecording();
         });
 
-        // Initialize UI
+
         updateButtons(false);
+        renderConversationHistory();
     </script>
 </body>
 

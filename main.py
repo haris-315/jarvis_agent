@@ -1,7 +1,7 @@
 import asyncio
 import json
 import os
-from fastapi import FastAPI, WebSocket
+from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 from dotenv import load_dotenv
@@ -12,6 +12,7 @@ from typing import TypedDict, List, Dict
 from openai import AsyncOpenAI
 from datetime import datetime
 import uuid
+import time
 
 load_dotenv()
 assemblyai_api_key = os.getenv("ASSEMBLYAI_API_KEY")
@@ -23,7 +24,7 @@ if not assemblyai_api_key or not openai_api_key:
 aai.settings.api_key = assemblyai_api_key
 openai_client = AsyncOpenAI(api_key=openai_api_key)
 
-# Session-based memory store
+
 session_memory: Dict[str, List[Dict[str, str]]] = {}
 
 class AgentState(TypedDict):
@@ -31,10 +32,8 @@ class AgentState(TypedDict):
     transcript: str
     response: str
 
-# -----------------------
-# LangGraph agent logic
-# -----------------------
-async def process_transcript(state: AgentState) -> AgentState:
+async def process_transcript_streaming(state: AgentState, websocket: WebSocket) -> AgentState:
+    """Process transcript with direct streaming to websocket"""
     session_id = state["session_id"]
     transcript = state["transcript"]
     
@@ -42,86 +41,130 @@ async def process_transcript(state: AgentState) -> AgentState:
         return {"session_id": session_id, "transcript": "", "response": ""}
     
     try:
-        # Retrieve session history or initialize it
         if session_id not in session_memory:
             session_memory[session_id] = []
         
-        # Build message history for context
+        
         messages = [
             {"role": "system", "content": "You are a helpful assistant. Respond concisely to the user's input, considering prior conversation context."}
         ]
-        # Add previous conversation history
+        
+        
         for entry in session_memory[session_id]:
-            messages.append({"role": "user", "content": entry["transcript"]})
-            messages.append({"role": "assistant", "content": entry["response"]})
-        # Add current transcript
+            messages.extend([
+                {"role": "user", "content": entry["transcript"]},
+                {"role": "assistant", "content": entry["response"]}
+            ])
         messages.append({"role": "user", "content": transcript})
 
-        completion = await openai_client.chat.completions.create(
-            model="gpt-4o-mini",
+        
+        stream = await openai_client.chat.completions.create(
+            model="gpt-3.5-turbo",
             messages=messages,
-            max_tokens=150
+            max_tokens=150,
+            temperature=0.7,
+            stream=True
         )
-        response = completion.choices[0].message.content
         
-        # Store the interaction in session memory
-        session_memory[session_id].append({"transcript": transcript, "response": response})
         
-        # Limit memory size to prevent unbounded growth (e.g., last 10 interactions)
+        full_response = ""
+        async for chunk in stream:
+            if chunk.choices[0].delta.content is not None:
+                content = chunk.choices[0].delta.content
+                full_response += content
+                
+                
+                if websocket.client_state == WebSocketState.CONNECTED:
+                    try:
+                        await websocket.send_text(json.dumps({
+                            "type": "chunk",
+                            "text": content
+                        }))
+                    except Exception as e:
+                        print(f"Error sending chunk: {e}")
+                        break
+        
+        
+        if websocket.client_state == WebSocketState.CONNECTED:
+            try:
+                await websocket.send_text(json.dumps({
+                    "type": "end",
+                    "text": ""
+                }))
+            except Exception as e:
+                print(f"Error sending end marker: {e}")
+        
+        
+        session_memory[session_id].append({"transcript": transcript, "response": full_response})
+        
+        
         if len(session_memory[session_id]) > 10:
             session_memory[session_id] = session_memory[session_id][-10:]
         
-        return {"session_id": session_id, "transcript": transcript, "response": response}
+        return {"session_id": session_id, "transcript": transcript, "response": full_response}
+        
     except Exception as e:
         print(f"OpenAI error: {e}")
-        return {"session_id": session_id, "transcript": transcript, "response": f"Error: {e}"}
+        error_msg = f"Error: {e}"
+        if websocket.client_state == WebSocketState.CONNECTED:
+            try:
+                await websocket.send_text(json.dumps({
+                    "type": "error",
+                    "text": error_msg
+                }))
+            except:
+                pass
+        return {"session_id": session_id, "transcript": transcript, "response": error_msg}
 
-workflow = StateGraph(AgentState)
-workflow.add_node("process_transcript", process_transcript)
-workflow.set_entry_point("process_transcript")
-workflow.set_finish_point("process_transcript")
-graph = workflow.compile()
 
 app = FastAPI()
 templates = Jinja2Templates(directory="templates")
 
-# -----------------------
-# HTML route
-# -----------------------
 @app.get("/")
-async def get():
-    with open("templates/index.html") as f:
-        return HTMLResponse(content=f.read())
+async def get(request: Request):
+    
+    
+    return templates.TemplateResponse("index.html",context={"request" : request})
 
-# -----------------------
-# WebSocket endpoint
-# -----------------------
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    session_id = str(uuid.uuid4())  # Unique session ID for this WebSocket
+    session_id = str(uuid.uuid4())
     print(f"WebSocket connected at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} with session ID: {session_id}")
 
     loop = asyncio.get_running_loop()
     processing_lock = asyncio.Lock()
     last_transcript = None
-    debounce_timeout = 1.0  # 1-second debounce for transcript processing
+    debounce_timeout = 0.5  
+    
+    
+    is_processing = False
 
     async def on_data(transcript: aai.RealtimeTranscript):
-        nonlocal last_transcript
-        if not transcript.text or str(transcript.message_type) == "RealtimeMessageTypes.partial_transcript":
-            return  # Skip partial transcripts
+        nonlocal last_transcript, is_processing
         
-        # Debounce: only process if transcript is new and enough time has passed
-        if transcript.text == last_transcript:
-            return  # Skip duplicate transcripts
+        if not transcript.text or str(transcript.message_type) == "RealtimeMessageTypes.partial_transcript":
+            return
+        
+        if transcript.text == last_transcript or is_processing:
+            return
+            
         last_transcript = transcript.text
+        is_processing = True
 
-        async with processing_lock:
-            await send_gpt_response(websocket, session_id, transcript.text)
-            await asyncio.sleep(debounce_timeout)  # Wait to avoid rapid successive calls
+        
+        start_time = time.time()
 
-    # Initialize transcriber
+        try:
+            
+            await send_gpt_response_streaming(websocket, session_id, transcript.text, start_time)
+        finally:
+            is_processing = False
+            
+            await asyncio.sleep(0.1)
+
     try:
         transcriber = aai.RealtimeTranscriber(
             sample_rate=16000,
@@ -142,7 +185,6 @@ async def websocket_endpoint(websocket: WebSocket):
         await websocket.close()
         return
 
-    # Stream audio from client to AssemblyAI
     try:
         while True:
             data = await websocket.receive_bytes()
@@ -156,20 +198,38 @@ async def websocket_endpoint(websocket: WebSocket):
             transcriber.close()
         except Exception as e:
             print(f"Error closing transcriber: {e}")
-        # Clean up session memory
         if session_id in session_memory:
             del session_memory[session_id]
         await websocket.close()
         print(f"WebSocket closed for session ID: {session_id}")
 
-# -----------------------
-# Send response to frontend
-# -----------------------
-async def send_gpt_response(websocket: WebSocket, session_id: str, transcript: str):
+async def send_gpt_response_streaming(websocket: WebSocket, session_id: str, transcript: str, start_time: float):
+    """Send GPT response with immediate streaming"""
     try:
-        result = await graph.ainvoke({"session_id": session_id, "transcript": transcript, "response": ""})
-        response = result["response"]
-        if response and websocket.client_state == WebSocketState.CONNECTED:
-            await websocket.send_text(json.dumps({"text": response}))
+        
+        if websocket.client_state == WebSocketState.CONNECTED:
+            await websocket.send_text(json.dumps({
+                "type": "start",
+                "text": "",
+                "transcript": transcript
+            }))
+        
+        
+        state = {"session_id": session_id, "transcript": transcript, "response": ""}
+        result = await process_transcript_streaming(state, websocket)
+        
+        
+        end_time = time.time()
+        total_time = end_time - start_time
+        print(f"Processing time for transcript '{transcript[:30]}...': {total_time:.3f} seconds")
+        
     except Exception as e:
         print(f"Error in GPT response: {e}")
+        if websocket.client_state == WebSocketState.CONNECTED:
+            try:
+                await websocket.send_text(json.dumps({
+                    "type": "error",
+                    "text": f"Error: {e}"
+                }))
+            except:
+                pass
