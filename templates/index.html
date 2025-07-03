@@ -71,7 +71,7 @@
 </head>
 
 <body>
-    <h2>🧠 LangChain Voice Assistant</h2>
+    <h2>🧠 LangGraph Voice Assistant</h2>
 
     <div id="status" class="status-disconnected">
         Status: Disconnected
@@ -161,7 +161,7 @@
                 updateStatus("Connecting to server...", "status-recording");
 
                 // Connect to WebSocket
-                socket = new WebSocket("ws://localhost:8004/ws");
+                socket = new WebSocket("ws://localhost:8000/ws");
 
                 socket.onopen = () => {
                     console.log("WebSocket connected");
