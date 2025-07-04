@@ -320,11 +320,12 @@
                 updateStatus("Connecting to server...", "status-recording");
 
 
-                socket = new WebSocket("ws://06af-116-71-186-218.ngrok-free.app/ws");
+                socket = new WebSocket("ws://localhost:8000/ws");
 
                 socket.onopen = () => {
                     console.log("WebSocket connected");
                     updateStatus("Connected - Recording...", "status-connected");
+                    socket.send('{"authToken" : "this is auth token","projects" : ["p1"], "tasks" : [{"name" : "this is task"}]}')
                     isRecording = true;
                     updateButtons(true);
                     updateTranscript('Listening...');
