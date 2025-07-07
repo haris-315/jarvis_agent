@@ -5,7 +5,8 @@
     <title>Voice Assistant (WebSocket Test)</title>
     <style>
         h2,
-        .ch {
+        .ch,
+        .ct {
             color: white;
         }
 
@@ -173,7 +174,7 @@
     <button id="stopBtn" class="stop-btn" onclick="stopRecording()" disabled>🛑 Stop</button>
     <button id="clearBtn" class="start-btn" onclick="clearConversation()">🗑️ Clear</button>
 
-    <p><strong>Current Transcript:</strong></p>
+    <p><strong class="ct">Current Transcript:</strong></p>
     <div id="transcript">Listening...</div>
 
     <p><strong class="ch">Assistant Response:</strong></p>

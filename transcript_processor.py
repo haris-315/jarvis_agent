@@ -1,10 +1,10 @@
 import json
-from typing import TypedDict, Dict, List, Any
+from typing import TypedDict, Dict, List, Any, Optional
 from fastapi import WebSocket
 from fastapi.websockets import WebSocketState
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
-from langgraph.prebuilt import ToolNode, tools_condition
+from langchain_core.messages import AIMessage, ToolMessage, HumanMessage, SystemMessage
 from langgraph.graph import StateGraph, END
 from config import openai_client
 import httpx
@@ -13,7 +13,7 @@ class AgentState(TypedDict):
     session_id: str
     transcript: str
     response: str
-    messages: List[Dict[str, Any]]
+    messages: List[Any]
     session_memory: Dict[str, Dict[str, Any]]
 
 @tool
@@ -22,13 +22,13 @@ async def create_task(
     description: str,
     priority: int,
     project_id: int,
-    due_date: str | None = None,
-    reminder_at: str | None = None
+    due_date: Optional[str] = None,
+    reminder_at: Optional[str] = None
 ) -> dict:
     """Create a new task in the task manager."""
     state = AgentStateRegistry.get_state()
     async with httpx.AsyncClient() as client:
-        base_url = "http://your-api-base-url"  # Replace with your actual API base URL
+        base_url = "https://jarvis.trylenoxinstruments.com"  # Using the URL from your update_task function
         auth_token = state["session_memory"][state["session_id"]]["auth_token"]
         try:
             response = await client.post(
@@ -59,13 +59,13 @@ async def update_task(
     is_completed: bool,
     priority: int,
     project_id: int,
-    due_date: str | None = None,
-    reminder_at: str | None = None
+    due_date: Optional[str] = None,
+    reminder_at: Optional[str] = None
 ) -> dict:
     """Update an existing task."""
     state = AgentStateRegistry.get_state()
     async with httpx.AsyncClient() as client:
-        base_url = "http://your-api-base-url"
+        base_url = "https://jarvis.trylenoxinstruments.com"
         auth_token = state["session_memory"][state["session_id"]]["auth_token"]
         try:
             response = await client.put(
@@ -104,7 +104,7 @@ async def create_project(
     """Create a new project."""
     state = AgentStateRegistry.get_state()
     async with httpx.AsyncClient() as client:
-        base_url = "http://your-api-base-url"
+        base_url = "https://jarvis.trylenoxinstruments.com"
         auth_token = state["session_memory"][state["session_id"]]["auth_token"]
         try:
             response = await client.post(
@@ -153,95 +153,204 @@ class AgentStateRegistry:
 
 # Define tools and model
 tools = [create_task, update_task, create_project, get_current_tasks, get_current_projects]
-tool_node = ToolNode(tools)
 model = ChatOpenAI(model="gpt-3.5-turbo", openai_api_key=openai_client.api_key).bind_tools(tools)
 
-# Define graph
-async def call_model(state: AgentState) -> AgentState:
-    system_prompt = f"""
-    You are Jarvis, a helpful assistant for a task manager app. Respond concisely in plain text suitable for text-to-speech, avoiding JSON or action details. Use function calls for actions like creating tasks, updating tasks, creating projects, or fetching current tasks/projects.
-
-    Current projects: {', '.join(state['session_memory'][state['session_id']]['projects'])}
-    Current tasks: {', '.join([t.get('content', 'Unknown') for t in state['session_memory'][state['session_id']]['tasks']])}
-
-    Rules:
-    - Use create_task for new tasks, assigning to 'Inbox' (project_id=1) if no project matches.
-    - Use update_task for task modifications.
-    - Use create_project for new projects.
-    - Use get_current_tasks or get_current_projects to fetch task/project info when asked.
-    - For prompts requiring multiple actions (e.g., create project and tasks), execute functions in the correct order: create project first, then tasks with the new project's ID.
-    - Respond in a friendly, conversational tone.
-    """
-
-    messages = [{"role": "system", "content": system_prompt}] + state["messages"] + [{"role": "user", "content": state["transcript"]}]
-    AgentStateRegistry.set_state(state)  # Set state for tool access
+def should_continue(state: AgentState) -> str:
+    """Determine if we should continue to tools or end."""
+    if not state["messages"]:
+        return "end"
     
+    last_message = state["messages"][-1]
+    if isinstance(last_message, AIMessage) and hasattr(last_message, "tool_calls") and last_message.tool_calls:
+        return "tools"
+    return "end"
+
+async def call_model(state: AgentState) -> AgentState:
+    """Call the model with the current state."""
     try:
+        # Get current session data
+        session_data = state["session_memory"][state["session_id"]]
+        
+        system_prompt = f"""
+You are Jarvis, a helpful assistant for a task manager app. Respond concisely in plain text suitable for text-to-speech, avoiding JSON or action details. Use function calls for actions like creating tasks, updating tasks, creating projects, or fetching current tasks/projects.
+
+Current projects: {', '.join(session_data['projects'])}
+Current tasks: {', '.join([str(t.get('content', 'Unknown')) for t in session_data['tasks']])}
+
+Rules:
+- Use create_task for new tasks, assigning to 'Inbox' (project_id=1) if no project matches.
+- Use update_task for task modifications.
+- Use create_project for new projects.
+- Use get_current_tasks or get_current_projects to fetch task/project info when asked.
+- For prompts requiring multiple actions (e.g., create project and tasks), execute functions in the correct order: create project first, then tasks with the new project's ID.
+- Respond in a friendly, conversational tone.
+"""
+
+        # Build messages list
+        messages = [SystemMessage(content=system_prompt)]
+        
+        # Add conversation history (excluding duplicate system messages)
+        for msg in state["messages"]:
+            if not isinstance(msg, SystemMessage):
+                messages.append(msg)
+        
+        # Add current transcript if not already in messages
+        if not any(isinstance(m, HumanMessage) and m.content == state["transcript"] for m in messages):
+            messages.append(HumanMessage(content=state["transcript"]))
+
+        # Set state for tools
+        AgentStateRegistry.set_state(state)
+
+        # Get response from model
         response = await model.ainvoke(messages)
-        print(response)
+        print(f"Model response: {response}")
+
+        # Update state with response
+        state["messages"] = messages[1:] + [response]  # Exclude system message from stored messages
+        state["response"] = response.content if response.content else ""
         
-        # Convert response to dictionary format
-        if hasattr(response, 'to_dict'):
-            state["messages"].append(response.to_dict())
-        else:
-            # Fallback for different response types
-            state["messages"].append({
-                "role": "assistant",
-                "content": response.content if hasattr(response, 'content') else str(response)
-            })
-        
-        state["response"] = response.content if hasattr(response, 'content') and response.content else ""
         return state
+        
     except Exception as e:
         print(f"Error in call_model: {e}")
-        state["response"] = "I'm sorry, I encountered an error processing your request."
+        error_message = f"Sorry, I ran into an issue: {str(e)}. Please try again or ask for something else."
+        state["messages"].append(AIMessage(content=error_message))
+        state["response"] = error_message
         return state
+
+async def custom_tool_node(state: AgentState) -> AgentState:
+    """Custom tool node to handle tool execution and append ToolMessage."""
+    if not state["messages"]:
+        return state
+        
+    last_message = state["messages"][-1]
+    if not isinstance(last_message, AIMessage) or not hasattr(last_message, "tool_calls"):
+        return state
+        
+    tool_calls = last_message.tool_calls
+    tool_messages = []
+
+    for tool_call in tool_calls:
+        tool_name = tool_call["name"]
+        tool_args = tool_call["args"]
+        tool_id = tool_call["id"]
+
+        # Find and execute the tool
+        tool_found = False
+        for tool in tools:
+            if tool.name == tool_name:  # Use .name instead of .__name__
+                tool_found = True
+                try:
+                    result = await tool.ainvoke(tool_args)
+                    tool_messages.append(ToolMessage(
+                        content=json.dumps(result),
+                        tool_call_id=tool_id,
+                        name=tool_name
+                    ))
+                    
+                    # Update response based on tool result
+                    if result.get("status") == "success":
+                        if tool_name == "create_project":
+                            state["response"] = f"Project '{tool_args.get('name', 'Unknown')}' created successfully!"
+                        elif tool_name == "create_task":
+                            state["response"] = f"Task '{tool_args.get('content', 'Unknown')}' added successfully!"
+                        elif tool_name == "update_task":
+                            state["response"] = f"Task updated successfully!"
+                        elif tool_name == "get_current_projects":
+                            projects = result.get("projects", [])
+                            state["response"] = f"Your current projects are: {', '.join(projects) if projects else 'none'}."
+                        elif tool_name == "get_current_tasks":
+                            tasks = [str(t.get("content", "Unknown")) for t in result.get("tasks", [])]
+                            state["response"] = f"Your current tasks are: {', '.join(tasks) if tasks else 'none'}."
+                    else:
+                        error_msg = result.get("error", "Unknown error")
+                        state["response"] = f"Sorry, I couldn't complete that action: {error_msg}. Please try again."
+                        
+                except Exception as e:
+                    error_message = f"Tool {tool_name} failed: {str(e)}"
+                    tool_messages.append(ToolMessage(
+                        content=json.dumps({"error": error_message}),
+                        tool_call_id=tool_id,
+                        name=tool_name
+                    ))
+                    state["response"] = f"Sorry, I couldn't {tool_name.replace('_', ' ')}: {str(e)}. Please try again."
+                break
+        
+        if not tool_found:
+            error_message = f"Tool {tool_name} not found"
+            tool_messages.append(ToolMessage(
+                content=json.dumps({"error": error_message}),
+                tool_call_id=tool_id,
+                name=tool_name
+            ))
+            state["response"] = f"Sorry, I couldn't find the requested function. Please try again."
+
+    # Add tool messages to state
+    state["messages"].extend(tool_messages)
+    return state
 
 # Build the graph
 def build_graph():
     graph = StateGraph(AgentState)
     graph.add_node("agent", call_model)
-    graph.add_node("tools", tool_node)
-    graph.add_edge("agent", "tools")
-    graph.add_conditional_edges("tools", tools_condition, {"agent": "agent", END: END})
+    graph.add_node("tools", custom_tool_node)
     graph.set_entry_point("agent")
+    graph.add_conditional_edges(
+        "agent",
+        should_continue,
+        {
+            "tools": "tools",
+            "end": END,
+        }
+    )
+    graph.add_edge("tools", "agent")
     return graph.compile()
 
 # Create the compiled graph
 app = build_graph()
 
 async def process_transcript_streaming(websocket: WebSocket, session_id: str, transcript: str, session_memory: Dict[str, Dict[str, Any]]) -> None:
-    if not transcript or len(transcript.strip()) <= 5:
+    """Process transcript and send streaming response."""
+    # Skip empty or very short transcripts
+    if not transcript or len(transcript.strip()) <= 3:
         if websocket.client_state == WebSocketState.CONNECTED:
             await websocket.send_text(json.dumps({"type": "end", "text": ""}))
         return
 
     try:
+        # Get conversation history
+        conversation_history = session_memory.get(session_id, {}).get("conversation", [])
+
+        # Create initial state
         state = {
             "session_id": session_id,
             "transcript": transcript,
             "response": "",
-            "messages": session_memory.get(session_id, {}).get("conversation", []),
+            "messages": conversation_history.copy(),
             "session_memory": session_memory
         }
 
+        # Send start message
         if websocket.client_state == WebSocketState.CONNECTED:
             await websocket.send_text(json.dumps({"type": "start", "text": "", "transcript": transcript}))
 
         # Process the state through the graph
-        final_state = await app.ainvoke(state)
-        
-        # Send the final response
-        if final_state.get("response") and websocket.client_state == WebSocketState.CONNECTED:
-            await websocket.send_text(json.dumps({"type": "chunk", "text": final_state["response"]}))
+        result = await app.ainvoke(state)
+        print(f"Graph result: {result}")
 
+        # Send response if available
+        if result.get("response") and websocket.client_state == WebSocketState.CONNECTED:
+            await websocket.send_text(json.dumps({"type": "chunk", "text": result["response"]}))
+
+        # Send end message
         if websocket.client_state == WebSocketState.CONNECTED:
             await websocket.send_text(json.dumps({"type": "end", "text": ""}))
 
-        # Update session memory with conversation history (keep last 10 messages)
-        session_memory[session_id]["conversation"] = final_state["messages"][-10:]
-        
+        # Update session memory (limit conversation history to last 10 messages)
+        filtered_messages = [m for m in result["messages"] if not isinstance(m, SystemMessage)]
+        session_memory[session_id]["conversation"] = filtered_messages[-10:]
+
     except Exception as e:
         print(f"Error in process_transcript_streaming: {e}")
         if websocket.client_state == WebSocketState.CONNECTED:
-            await websocket.send_text(json.dumps({"type": "error", "text": f"Error: {str(e)}"}))
+            await websocket.send_text(json.dumps({"type": "error", "text": f"Error: {str(e)}. Please try again."}))
